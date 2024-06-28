@@ -3,18 +3,18 @@
 import { WalletLinkCipher } from './connection/WalletLinkCipher';
 import { WalletLinkConnection } from './connection/WalletLinkConnection';
 import { WalletLinkWebSocket } from './connection/WalletLinkWebSocket';
-import { WALLET_USER_NAME_KEY } from './RelayAbstract';
+import { WALLET_USER_NAME_KEY } from './constants';
 import { ServerMessage } from './type/ServerMessage';
 import { WalletLinkSessionConfig } from './type/WalletLinkSessionConfig';
-import { WalletLinkRelay, WalletLinkRelayOptions } from './WalletLinkRelay';
-import { ScopedLocalStorage } from ':core/storage/ScopedLocalStorage';
+import { WalletLinkRelay } from './WalletLinkRelay';
+import { ScopedLocalStorage } from ':util/ScopedLocalStorage';
 
 const decryptMock = jest.fn().mockImplementation((text) => Promise.resolve(`"decrypted ${text}"`));
 
 jest.spyOn(WalletLinkCipher.prototype, 'decrypt').mockImplementation(decryptMock);
 
 describe('WalletLinkRelay', () => {
-  const options: WalletLinkRelayOptions = {
+  const options = {
     linkAPIUrl: 'http://link-api-url',
     storage: new ScopedLocalStorage('walletlink', 'test'),
   };
@@ -57,7 +57,9 @@ describe('WalletLinkRelay', () => {
 
       const relay = new WalletLinkRelay(options);
 
-      const handleWeb3ResponseMessageSpy = jest.spyOn(relay, 'handleWeb3ResponseMessage');
+      const handleWeb3ResponseMessageSpy = jest
+        .spyOn(relay, 'handleWeb3ResponseMessage')
+        .mockReturnValue();
 
       (relay as any).connection.ws.incomingDataListener?.(serverMessageEvent);
 

@@ -1,9 +1,9 @@
-import { APP_VERSION_KEY, WALLET_USER_NAME_KEY } from '../RelayAbstract';
+import { APP_VERSION_KEY, WALLET_USER_NAME_KEY } from '../constants';
 import { WalletLinkSession } from '../type/WalletLinkSession';
 import { WalletLinkSessionConfig } from '../type/WalletLinkSessionConfig';
 import { WalletLinkCipher } from './WalletLinkCipher';
 import { WalletLinkConnection, WalletLinkConnectionUpdateListener } from './WalletLinkConnection';
-import { ScopedLocalStorage } from ':core/storage/ScopedLocalStorage';
+import { ScopedLocalStorage } from ':util/ScopedLocalStorage';
 
 const decryptMock = jest.fn().mockImplementation((text) => Promise.resolve(`decrypted ${text}`));
 

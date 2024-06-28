@@ -1,129 +1,174 @@
-/* eslint-disable jest/no-commented-out-tests */
 import EventEmitter from 'eventemitter3';
 
-import { getErrorForInvalidRequestArgs } from './core/eip1193Utils';
-import { standardErrors } from './core/error';
-import { AddressString, Chain } from './core/type';
+import { standardErrorCodes, standardErrors } from './core/error';
+import { serializeError } from './core/error/serialize';
 import {
+  AppMetadata,
+  ConstructorOptions,
+  Preference,
   ProviderInterface,
-  ProviderRpcError,
   RequestArguments,
-} from './core/type/ProviderInterface';
-import { RequestHandler } from './core/type/RequestHandlerInterface';
-import { areAddressArraysEqual, prepend0x, showDeprecationWarning } from './core/util';
-import { FilterRequestHandler } from './filter/FilterRequestHandler';
-import { StateRequestHandler } from './internalState/StateRequestHandler';
-import { RPCFetchRequestHandler } from './rpcFetch/RPCFetchRequestHandler';
-import { SignRequestHandler } from './sign/SignRequestHandler';
-import { AccountsUpdate, ChainUpdate } from './sign/UpdateListenerInterface';
-import { SubscriptionRequestHandler } from './subscription/SubscriptionRequestHandler';
-
-interface ConstructorOptions {
-  appName: string;
-  appLogoUrl?: string | null;
-  appChainIds: number[];
-  smartWalletOnly: boolean;
-}
+  Signer,
+} from './core/provider/interface';
+import { AddressString, Chain, IntNumber } from './core/type';
+import { areAddressArraysEqual, hexStringFromIntNumber } from './core/type/util';
+import { createSigner, fetchSignerType, loadSignerType, storeSignerType } from './sign/util';
+import { checkErrorForInvalidRequestArgs, fetchRPCRequest } from './util/provider';
+import { Communicator } from ':core/communicator/Communicator';
+import { SignerType } from ':core/message';
+import { determineMethodCategory } from ':core/provider/method';
+import { ScopedLocalStorage } from ':util/ScopedLocalStorage';
 
 export class CoinbaseWalletProvider extends EventEmitter implements ProviderInterface {
-  private accounts: AddressString[] = [];
-  private chain: Chain;
+  private readonly metadata: AppMetadata;
+  private readonly preference: Preference;
+  private readonly communicator: Communicator;
 
-  private readonly handlers: RequestHandler[];
+  private signer: Signer | null;
+  protected accounts: AddressString[] = [];
+  protected chain: Chain;
 
-  public get chainId() {
-    return this.chain.id;
-  }
-
-  public get isCoinbaseWallet() {
-    return true;
-  }
-
-  constructor(options: Readonly<ConstructorOptions>) {
+  constructor({ metadata, preference: { keysUrl, ...preference } }: Readonly<ConstructorOptions>) {
     super();
-
+    this.metadata = metadata;
+    this.preference = preference;
+    this.communicator = new Communicator(keysUrl);
     this.chain = {
-      id: options.appChainIds?.[0] ?? 1,
+      id: metadata.appChainIds?.[0] ?? 1,
     };
-
-    this.handlers = [
-      new StateRequestHandler(),
-      new SignRequestHandler({
-        ...options,
-        updateListener: {
-          onAccountsUpdate: this.setAccounts.bind(this),
-          onChainUpdate: this.setChain.bind(this),
-          onConnect: this.emitConnectEvent.bind(this),
-          onResetConnection: this.disconnect.bind(this),
-        },
-      }),
-      new FilterRequestHandler({
-        provider: this,
-      }),
-      new SubscriptionRequestHandler({
-        provider: this,
-      }),
-      new RPCFetchRequestHandler(), // should be last
-    ];
+    // Load states from storage
+    const signerType = loadSignerType();
+    this.signer = signerType ? this.initSigner(signerType) : null;
   }
 
   public get connected() {
     return this.accounts.length > 0;
   }
 
-  async disconnect(): Promise<void> {
-    const disconnectInfo: ProviderRpcError = standardErrors.provider.disconnected(
-      'User initiated disconnection'
-    );
-    this.accounts = [];
-    this.chain = { id: 1 };
-    await Promise.all(
-      this.handlers.map(async (handler) => {
-        await handler.onDisconnect?.();
-      })
-    );
-    this.emit('disconnect', disconnectInfo);
+  public async request<T>(args: RequestArguments): Promise<T> {
+    try {
+      checkErrorForInvalidRequestArgs(args);
+      // unrecognized methods are treated as fetch requests
+      const category = determineMethodCategory(args.method) ?? 'fetch';
+      return this.handlers[category](args) as T;
+    } catch (error) {
+      this.handleUnauthorizedError(error);
+      return Promise.reject(serializeError(error, args.method));
+    }
   }
 
-  public async request<T>(args: RequestArguments): Promise<T> {
-    const invalidArgsError = getErrorForInvalidRequestArgs(args);
-    if (invalidArgsError) {
-      throw invalidArgsError;
-    }
+  protected readonly handlers = {
+    // eth_requestAccounts
+    handshake: async (_: RequestArguments): Promise<AddressString[]> => {
+      if (this.connected) {
+        this.emit('connect', { chainId: hexStringFromIntNumber(IntNumber(this.chain.id)) });
+        return this.accounts;
+      }
 
-    const handler = this.handlers.find((h) => h.canHandleRequest(args));
-    return handler?.handleRequest(args, this.accounts, this.chain) as T;
+      const signerType = await this.requestSignerSelection();
+      const signer = this.initSigner(signerType);
+      const accounts = await signer.handshake();
+
+      this.signer = signer;
+      storeSignerType(signerType);
+
+      this.emit('connect', { chainId: hexStringFromIntNumber(IntNumber(this.chain.id)) });
+      return accounts;
+    },
+
+    sign: async (request: RequestArguments) => {
+      if (!this.connected || !this.signer) {
+        throw standardErrors.provider.unauthorized(
+          "Must call 'eth_requestAccounts' before other methods"
+        );
+      }
+      return await this.signer.request(request);
+    },
+
+    fetch: (request: RequestArguments) => fetchRPCRequest(request, this.chain),
+
+    state: (request: RequestArguments) => {
+      const getConnectedAccounts = (): AddressString[] => {
+        if (this.connected) return this.accounts;
+        throw standardErrors.provider.unauthorized(
+          "Must call 'eth_requestAccounts' before other methods"
+        );
+      };
+      switch (request.method) {
+        case 'eth_chainId':
+          return hexStringFromIntNumber(IntNumber(this.chain.id));
+        case 'net_version':
+          return this.chain.id;
+        case 'eth_accounts':
+          return getConnectedAccounts();
+        case 'eth_coinbase':
+          return getConnectedAccounts()[0];
+        default:
+          return this.handlers.unsupported(request);
+      }
+    },
+
+    deprecated: ({ method }: RequestArguments) => {
+      throw standardErrors.rpc.methodNotSupported(`Method ${method} is deprecated.`);
+    },
+
+    unsupported: ({ method }: RequestArguments) => {
+      throw standardErrors.rpc.methodNotSupported(`Method ${method} is not supported.`);
+    },
+  };
+
+  private handleUnauthorizedError(error: unknown) {
+    const e = error as { code?: number };
+    if (e.code === standardErrorCodes.provider.unauthorized) this.disconnect();
   }
 
   /** @deprecated Use `.request({ method: 'eth_requestAccounts' })` instead. */
   public async enable(): Promise<unknown> {
-    showDeprecationWarning('enable', 'use request({ method: "eth_requestAccounts" })');
+    console.warn(
+      `.enable() has been deprecated. Please use .request({ method: "eth_requestAccounts" }) instead.`
+    );
     return await this.request({
       method: 'eth_requestAccounts',
     });
   }
 
-  private emitConnectEvent() {
-    this.emit('connect', { chainId: prepend0x(this.chain.id.toString(16)) });
+  async disconnect(): Promise<void> {
+    this.accounts = [];
+    this.chain = { id: 1 };
+    this.signer?.disconnect();
+    ScopedLocalStorage.clearAll();
+    this.emit('disconnect', standardErrors.provider.disconnected('User initiated disconnection'));
   }
 
-  private setAccounts({ accounts, source }: AccountsUpdate) {
-    if (areAddressArraysEqual(this.accounts, accounts)) {
-      return;
-    }
+  readonly isCoinbaseWallet = true;
 
-    this.accounts = accounts;
+  protected readonly updateListener = {
+    onAccountsUpdate: (accounts: AddressString[]) => {
+      if (areAddressArraysEqual(this.accounts, accounts)) return;
+      this.accounts = accounts;
+      this.emit('accountsChanged', this.accounts);
+    },
+    onChainUpdate: (chain: Chain) => {
+      if (chain.id === this.chain.id && chain.rpcUrl === this.chain.rpcUrl) return;
+      this.chain = chain;
+      this.emit('chainChanged', hexStringFromIntNumber(IntNumber(chain.id)));
+    },
+  };
 
-    if (source === 'storage') return;
-    this.emit('accountsChanged', this.accounts);
+  private requestSignerSelection(): Promise<SignerType> {
+    return fetchSignerType({
+      communicator: this.communicator,
+      preference: this.preference,
+      metadata: this.metadata,
+    });
   }
 
-  private setChain({ chain, source }: ChainUpdate) {
-    if (chain.id === this.chain.id && chain.rpcUrl === this.chain.rpcUrl) return;
-
-    this.chain = chain;
-
-    if (source === 'storage') return;
-    this.emit('chainChanged', prepend0x(chain.id.toString(16)));
+  private initSigner(signerType: SignerType): Signer {
+    return createSigner({
+      signerType,
+      metadata: this.metadata,
+      communicator: this.communicator,
+      updateListener: this.updateListener,
+    });
   }
 }

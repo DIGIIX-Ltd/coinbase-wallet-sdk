@@ -2,8 +2,8 @@
 
 import { sha256 } from 'sha.js';
 
-import { ScopedLocalStorage } from ':core/storage/ScopedLocalStorage';
-import { randomBytesHex } from ':core/util';
+import { randomBytesHex } from ':core/type/util';
+import { ScopedLocalStorage } from ':util/ScopedLocalStorage';
 
 const STORAGE_KEY_SESSION_ID = 'session:id';
 const STORAGE_KEY_SESSION_SECRET = 'session:secret';
@@ -38,14 +38,6 @@ export class WalletLinkSession {
     }
 
     return null;
-  }
-
-  /**
-   * Takes in a session ID and returns the sha256 hash of it.
-   * @param sessionId session ID
-   */
-  public static hash(sessionId: string): string {
-    return new sha256().update(sessionId).digest('hex');
   }
 
   public get id(): string {
